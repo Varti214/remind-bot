@@ -1,14 +1,16 @@
 """
-Бот-напоминалка для Telegram.
+Бот-напоминалка для Telegram. Версия 2.0.
 
 Как он работает в двух словах:
 1. Бот всё время спрашивает у серверов Telegram: «Есть новые сообщения?»
    Это называется polling (опрос). Библиотека telebot делает это за нас.
-2. Когда приходит команда (/remind, /list, ...) или нажатие кнопки, telebot
-   вызывает функцию-обработчик, которую мы привязали к этому событию.
-3. Напоминания хранятся в файле reminders.json, поэтому они не пропадают,
+2. Когда приходит сообщение, команда или нажатие кнопки, telebot вызывает
+   функцию-обработчик, которую мы привязали к этому событию.
+3. Время из обычного текста («через 10 минут», «завтра в 9») разбирает
+   соседний файл timeparser.py.
+4. Напоминания хранятся в файле reminders.json, поэтому они не пропадают,
    если бота выключить и включить снова.
-4. Параллельно работает отдельный поток (thread) — как второй работник,
+5. Параллельно работает отдельный поток (thread) — как второй работник,
    который раз в минуту смотрит на часы и рассылает напоминания, чьё время пришло.
 """
 
@@ -28,6 +30,9 @@ from dotenv import load_dotenv  # читает настройки из файл�
 from telebot import types  # кнопки и клавиатуры
 from telebot.apihelper import ApiTelegramException  # ошибка, которую присылает Telegram
 
+# Наш собственный файл timeparser.py: разбор времени из текста
+from timeparser import REPEAT_LABELS, WhenError, in_minutes, next_repeat, parse_when
+
 
 # ===========================================================================
 # 1. НАСТРОЙКИ
@@ -40,7 +45,8 @@ BASE_DIR = Path(__file__).resolve().parent
 # load_dotenv() читает файл .env и делает его строки доступными через os.getenv().
 # Зачем так сложно, почему не написать токен прямо в коде? Токен — это пароль
 # от бота. Если код попадёт на GitHub вместе с токеном, любой сможет управлять
-# ботом. Файл .env мы в GitHub не загружаем (он указан в .gitignore).
+# ботом. На компьютере токен лежит в файле .env, а на хостинге — в его настройках
+# (Environment Variables): os.getenv() читает и оттуда, и оттуда.
 load_dotenv(BASE_DIR / ".env")
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
@@ -48,6 +54,7 @@ TIMEZONE_NAME = os.getenv("TIMEZONE", "Europe/Moscow").strip()
 DATA_FILE = BASE_DIR / "reminders.json"
 MAX_TEXT_LENGTH = 1000  # ограничим длину текста напоминания, чтобы сообщение точно влезло в Telegram
 LIST_LIMIT = 20         # сколько напоминаний максимум показывать в /list (у сообщения есть предел длины)
+KEEP_FIRED_DAYS = 3     # сколько дней помнить сработавшее напоминание, чтобы его можно было отложить
 
 # logging — «журнал» программы: печатает в консоль, что происходит, с датой и временем.
 # Удобнее, чем print(): сразу видно, когда случилось событие.
@@ -110,7 +117,9 @@ except ValueError:
 #       "id": 3,                   <- номер напоминания (его показывает /list)
 #       "chat_id": 123456789,      <- в какой чат отправить напоминание
 #       "text": "Позвонить маме",  <- что напомнить
-#       "due": "2026-09-29T18:30:00+03:00"   <- когда: дата, время и часовой пояс
+#       "due": "2026-09-29T18:30:00+03:00",   <- когда: дата, время и часовой пояс
+#       "repeat": "daily",         <- повтор: daily / weekdays / weekly (у разовых этого поля нет)
+#       "fired_at": "2026-09-29T18:30:00+03:00"  <- есть только у уже сработавших разовых
 #     }
 #   ]
 # }
@@ -120,6 +129,10 @@ except ValueError:
 # /delete 2, первое напоминание срабатывает и исчезает — и «Купить хлеб» становится
 # номером 1. Команда удалила бы не то. Сквозной номер закреплён за напоминанием
 # навсегда, поэтому такой путаницы не бывает.
+#
+# Зачем хранить сработавшие напоминания (fired_at)? Чтобы работала кнопка «Отложить»:
+# когда её нажимают, бот должен помнить текст напоминания. Через KEEP_FIRED_DAYS дней
+# такие записи удаляются сами.
 
 # Замок (lock). С данными работают сразу два потока: обработчики команд и проверка
 # по времени. Если оба одновременно начнут менять список, данные могут испортиться.
@@ -157,7 +170,12 @@ def save_data():
     tmp_file.replace(DATA_FILE)
 
 
-def create_reminder(chat_id, text, due):
+def is_active(reminder):
+    """Активное напоминание — то, которое ещё ждёт своего времени."""
+    return "fired_at" not in reminder
+
+
+def create_reminder(chat_id, text, due, repeat=None):
     """Добавляет напоминание в список, сохраняет файл и возвращает созданное напоминание."""
     with data_lock:
         reminder = {
@@ -166,20 +184,32 @@ def create_reminder(chat_id, text, due):
             "text": text,
             "due": due.isoformat(),  # isoformat() превращает дату в строку для JSON
         }
+        if repeat:
+            reminder["repeat"] = repeat
         data["reminders"].append(reminder)
         data["next_id"] += 1
         save_data()
-    log.info("Новое напоминание №%s для чата %s на %s", reminder["id"], chat_id, reminder["due"])
+    log.info("Новое напоминание №%s для чата %s на %s%s", reminder["id"], chat_id, reminder["due"],
+             f" (повтор: {repeat})" if repeat else "")
     return reminder
 
 
-def delete_reminder(chat_id, number):
+def find_reminder(chat_id, number):
+    """Ищет напоминание по номеру в этом чате (и активное, и недавно сработавшее)."""
+    with data_lock:
+        for r in data["reminders"]:
+            # Проверяем и номер, и чат: так никто не доберётся до чужого напоминания, подобрав номер
+            if r["id"] == number and r["chat_id"] == chat_id:
+                return r
+    return None
+
+
+def delete_reminder(chat_id, number, only_active=True):
     """Удаляет напоминание с таким номером из этого чата. Возвращает удалённое или None."""
     found = None
     with data_lock:
         for r in data["reminders"]:
-            # Проверяем и номер, и чат: так никто не удалит чужое напоминание, подобрав номер
-            if r["id"] == number and r["chat_id"] == chat_id:
+            if r["id"] == number and r["chat_id"] == chat_id and (is_active(r) or not only_active):
                 found = r
                 break
         if found:
@@ -188,42 +218,42 @@ def delete_reminder(chat_id, number):
     return found
 
 
+def set_repeat(chat_id, number, repeat):
+    """Включает, меняет или выключает (repeat=None) повтор. Возвращает напоминание или None."""
+    with data_lock:
+        for r in data["reminders"]:
+            if r["id"] == number and r["chat_id"] == chat_id and is_active(r):
+                if repeat:
+                    r["repeat"] = repeat
+                    due = get_due(r)
+                    # «По будням» для напоминания на субботу: переносим первый раз на понедельник
+                    while repeat == "weekdays" and due.weekday() >= 5:
+                        due += timedelta(days=1)
+                    r["due"] = due.isoformat()
+                else:
+                    r.pop("repeat", None)
+                save_data()
+                return r
+    return None
+
+
 # Загружаем напоминания один раз при запуске бота
 data = load_data()
 
 
 # ===========================================================================
-# 3. ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ДЛЯ ВРЕМЕНИ
+# 3. ВРЕМЯ
 # ===========================================================================
+# Разбор фраз вроде «через 2 часа» или «завтра в 9» живёт в файле timeparser.py.
+# Здесь — только мелкие помощники для вывода времени на экран.
 
-def parse_time(text):
-    """Превращает строку '18:30' в пару чисел (18, 30). Если время неправильное — возвращает None."""
-    text = text.strip().replace(".", ":")  # разрешим писать и 18.30
-    try:
-        # strptime разбирает строку по шаблону: %H — часы (0–23), %M — минуты (0–59).
-        # Если написать 25:00 или 18:75, будет ошибка ValueError.
-        parsed = datetime.strptime(text, "%H:%M")
-    except ValueError:
-        return None
-    return parsed.hour, parsed.minute
+def now_local():
+    return datetime.now(TZ)
 
 
-def next_occurrence(hour, minute):
-    """Ближайший момент с указанным временем: сегодня, а если уже прошло — завтра."""
-    now = datetime.now(TZ)
-    due = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
-    if due <= now:
-        due += timedelta(days=1)
-    return due
-
-
-def after_minutes(minutes):
-    """Момент «через N минут», округлённый вверх до целой минуты (проверка идёт раз в минуту)."""
-    exact = datetime.now(TZ) + timedelta(minutes=minutes)
-    due = exact.replace(second=0, microsecond=0)
-    if due < exact:
-        due += timedelta(minutes=1)
-    return due
+def understand(text, allow_bare=False):
+    """Ищет время в тексте. Возвращает результат разбора, None или бросает WhenError."""
+    return parse_when(text, now_local(), allow_bare=allow_bare)
 
 
 def get_due(reminder):
@@ -233,13 +263,14 @@ def get_due(reminder):
 
 def human_when(due):
     """Красиво пишет время: «сегодня в 18:30», «завтра в 09:00» или «05.10 в 12:00»."""
-    today = datetime.now(TZ).date()
+    today = now_local().date()
     time_str = due.strftime("%H:%M")
     if due.date() == today:
         return f"сегодня в {time_str}"
     if due.date() == today + timedelta(days=1):
         return f"завтра в {time_str}"
-    return f"{due.strftime('%d.%m')} в {time_str}"
+    date_str = due.strftime("%d.%m") if due.year == today.year else due.strftime("%d.%m.%Y")
+    return f"{date_str} в {time_str}"
 
 
 def capitalize(text):
@@ -268,14 +299,27 @@ BTN_NEW = "➕ Новое напоминание"
 BTN_LIST = "📋 Мои напоминания"
 BTN_HELP = "❓ Помощь"
 
-# Кнопки быстрого выбора времени: (надпись на кнопке, данные для callback)
+# Кнопки быстрого выбора времени: (надпись, фраза). Фразу разбирает тот же timeparser,
+# что и текст от пользователя — поэтому добавить свою кнопку можно одной строкой.
 QUICK_TIMES = [
-    ("⏱ +10 мин", "+10"),
-    ("⏱ +30 мин", "+30"),
-    ("⏱ +1 час", "+60"),
-    ("⏱ +3 часа", "+180"),
-    ("🌅 Завтра в 9:00", "tomorrow"),
+    ("5 мин", "через 5 минут"),
+    ("15 мин", "через 15 минут"),
+    ("30 мин", "через 30 минут"),
+    ("1 час", "через 1 час"),
+    ("2 часа", "через 2 часа"),
+    ("3 часа", "через 3 часа"),
+    ("🌆 Вечером", "вечером"),
+    ("🌅 Завтра утром", "завтра в 9:00"),
 ]
+
+TIME_EXAMPLES = (
+    "<code>через 45 минут</code> · <code>в 18:30</code> · <code>завтра в 9</code> · "
+    "<code>в пятницу вечером</code> · <code>5 октября 12:00</code>"
+)
+
+
+def button(text, data_):
+    return types.InlineKeyboardButton(text, callback_data=data_)
 
 
 def main_keyboard():
@@ -283,7 +327,7 @@ def main_keyboard():
     keyboard = types.ReplyKeyboardMarkup(
         resize_keyboard=True,   # подогнать высоту кнопок под содержимое, иначе они огромные
         is_persistent=True,     # не прятать клавиатуру после нажатия
-        input_field_placeholder="Выберите действие ниже 👇",  # серая подсказка в поле ввода
+        input_field_placeholder="Например: через 10 минут позвонить",  # серая подсказка в поле ввода
     )
     keyboard.row(BTN_NEW)             # первый ряд — одна широкая кнопка
     keyboard.row(BTN_LIST, BTN_HELP)  # второй ряд — две кнопки
@@ -293,26 +337,47 @@ def main_keyboard():
 def cancel_keyboard():
     """Одна inline-кнопка «Отмена» под сообщением."""
     keyboard = types.InlineKeyboardMarkup()
-    keyboard.row(types.InlineKeyboardButton("✖️ Отмена", callback_data="cancel"))
+    keyboard.row(button("✖️ Отмена", "cancel"))
     return keyboard
 
 
 def time_keyboard():
-    """Inline-кнопки быстрого выбора времени."""
-    buttons = [types.InlineKeyboardButton(label, callback_data=f"time:{code}") for label, code in QUICK_TIMES]
+    """Inline-кнопки быстрого выбора времени. В callback_data — номер кнопки в списке QUICK_TIMES."""
+    buttons = [button(label, f"time:{index}") for index, (label, _phrase) in enumerate(QUICK_TIMES)]
     keyboard = types.InlineKeyboardMarkup()
-    keyboard.row(*buttons[:3])  # звёздочка «раскладывает» список на отдельные аргументы
-    keyboard.row(*buttons[3:])
-    keyboard.row(types.InlineKeyboardButton("✖️ Отмена", callback_data="cancel"))
+    keyboard.row(*buttons[0:3])  # звёздочка «раскладывает» список на отдельные аргументы
+    keyboard.row(*buttons[3:6])
+    keyboard.row(*buttons[6:8])
+    keyboard.row(button("✖️ Отмена", "cancel"))
     return keyboard
 
 
-def due_from_quick(code):
-    """Превращает данные кнопки ("+10", "tomorrow") в конкретный момент времени."""
-    if code == "tomorrow":
-        tomorrow = datetime.now(TZ) + timedelta(days=1)
-        return tomorrow.replace(hour=9, minute=0, second=0, microsecond=0)
-    return after_minutes(int(code.lstrip("+")))
+def created_keyboard(reminder):
+    """Кнопки под сообщением «напоминание создано»."""
+    repeat = reminder.get("repeat")
+    label = f"🔁 {capitalize(REPEAT_LABELS[repeat])}" if repeat else "🔁 Повторять"
+    keyboard = types.InlineKeyboardMarkup()
+    keyboard.row(button(label, f"rep:{reminder['id']}"), button("🗑 Удалить", f"rm:{reminder['id']}"))
+    return keyboard
+
+
+def repeat_keyboard(reminder):
+    """Меню выбора повтора."""
+    rid = reminder["id"]
+    keyboard = types.InlineKeyboardMarkup()
+    keyboard.row(button("Каждый день", f"setrep:{rid}:daily"), button("По будням", f"setrep:{rid}:weekdays"))
+    keyboard.row(button("Каждую неделю", f"setrep:{rid}:weekly"), button("Не повторять", f"setrep:{rid}:none"))
+    keyboard.row(button("← Назад", f"setrep:{rid}:keep"))
+    return keyboard
+
+
+def fired_keyboard(reminder):
+    """Кнопки под сработавшим напоминанием: отложить или отметить выполненным."""
+    rid = reminder["id"]
+    keyboard = types.InlineKeyboardMarkup()
+    keyboard.row(button("⏰ +10 мин", f"snz:{rid}:10"), button("⏰ +1 час", f"snz:{rid}:60"))
+    keyboard.row(button("🌅 Завтра утром", f"snz:{rid}:tom"), button("✅ Готово", f"done:{rid}"))
+    return keyboard
 
 
 def text_error(text):
@@ -326,22 +391,23 @@ def text_error(text):
 
 def created_text(reminder):
     """Сообщение «напоминание создано»."""
-    return (
-        f"✅ <b>Готово!</b> Напомню {human_when(get_due(reminder))}\n\n"
-        f"📝 {escape(reminder['text'])}\n"
-        f"🔢 Номер: <b>{reminder['id']}</b>"
-    )
+    lines = [f"✅ <b>Готово!</b> Напомню {human_when(get_due(reminder))}"]
+    if reminder.get("repeat"):
+        lines.append(f"🔁 Дальше — {REPEAT_LABELS[reminder['repeat']]}")
+    lines += ["", f"📝 {escape(reminder['text'])}", f"🔢 Номер: <b>{reminder['id']}</b>"]
+    return "\n".join(lines)
 
 
 def render_list(chat_id):
     """Готовит текст списка напоминаний и inline-кнопки удаления. Возвращает (текст, клавиатура)."""
     with data_lock:
-        # Берём только напоминания из этого чата: чужие показывать нельзя
-        mine = [r for r in data["reminders"] if r["chat_id"] == chat_id]
+        # Берём только активные напоминания из этого чата: чужие показывать нельзя
+        mine = [r for r in data["reminders"] if r["chat_id"] == chat_id and is_active(r)]
 
     if not mine:
         return ("📭 <b>Напоминаний нет</b>\n\n"
-                f"Нажмите <b>{BTN_NEW}</b> внизу, чтобы создать первое."), None
+                "Просто напишите, что и когда напомнить, например:\n"
+                "<code>через 10 минут выключить плиту</code>"), None
 
     mine.sort(key=get_due)  # сортируем по времени: ближайшие — сверху
     shown = mine[:LIST_LIMIT]
@@ -351,8 +417,9 @@ def render_list(chat_id):
     for r in shown:
         due = get_due(r)
         text = r["text"] if len(r["text"]) <= 100 else r["text"][:100] + "…"  # длинное обрежем
-        lines.append(f"🕐 <b>{capitalize(human_when(due))}</b> · №{r['id']}\n📝 {escape(text)}\n")
-        buttons.append(types.InlineKeyboardButton(f"🗑 №{r['id']} · {due:%H:%M}", callback_data=f"del:{r['id']}"))
+        repeat = f" · 🔁 {REPEAT_LABELS[r['repeat']]}" if r.get("repeat") else ""
+        lines.append(f"🕐 <b>{capitalize(human_when(due))}</b> · №{r['id']}{repeat}\n📝 {escape(text)}\n")
+        buttons.append(button(f"🗑 №{r['id']} · {due:%H:%M}", f"del:{r['id']}"))
 
     if len(mine) > LIST_LIMIT:
         lines.append(f"<i>…и ещё {len(mine) - LIST_LIMIT}. Удалить их можно командой /delete номер</i>\n")
@@ -374,45 +441,61 @@ def edit_message(message, text, keyboard=None):
             log.warning("Не удалось изменить сообщение: %s", error)
 
 
-def remove_buttons(chat_id, message_id):
-    """Убирает inline-кнопки у старого сообщения, чтобы их не нажимали повторно."""
+def set_buttons(chat_id, message_id, keyboard=None):
+    """Меняет inline-кнопки у сообщения. Без keyboard — убирает их, чтобы не нажимали повторно."""
     if not message_id:
         return
     try:
-        bot.edit_message_reply_markup(chat_id, message_id, reply_markup=None)
+        bot.edit_message_reply_markup(chat_id, message_id, reply_markup=keyboard)
     except ApiTelegramException:
         pass  # сообщение могло быть удалено или кнопок уже нет — ничего страшного
 
 
 START_TEXT = (
     "👋 Привет, <b>{name}</b>!\n\n"
-    "Я бот-напоминалка ⏰ Помогу не забыть важное.\n\n"
-    f"Нажмите <b>{BTN_NEW}</b> внизу экрана — я спрошу, что и когда напомнить.\n"
-    "Описание всех возможностей — в /help"
+    "Я бот-напоминалка ⏰ Просто напишите мне, что и когда напомнить:\n\n"
+    "<code>через 10 минут выключить плиту</code>\n"
+    "<code>завтра в 9 позвонить врачу</code>\n"
+    "<code>каждый день в 8:00 зарядка</code>\n\n"
+    f"Или нажмите <b>{BTN_NEW}</b> внизу — спрошу всё по шагам.\n"
+    "Все возможности — в /help"
 )
 
 HELP_TEXT = (
     "❓ <b>Как пользоваться ботом</b>\n\n"
+    "<b>Проще всего — написать одним сообщением</b>\n"
+    "<code>через 10 минут выключить плиту</code>\n"
+    "<code>завтра в 9 позвонить врачу</code>\n"
+    "<code>купить цветы в пятницу вечером</code>\n"
+    "<code>5 октября 12:00 встреча</code>\n"
+    "<code>каждый день в 8:00 зарядка</code>\n\n"
+    "<b>Как можно указать время</b>\n"
+    "⏱ через 5 минут · через 2 часа · через полчаса · через 3 дня\n"
+    "🕐 в 18:30 · в 7 вечера · утром · вечером\n"
+    "📅 завтра · послезавтра · в пятницу · 5 октября · 05.10 18:30\n"
+    "🔁 каждый день · по будням · каждую пятницу · каждое утро\n\n"
+    "<b>Когда напоминание пришло</b>\n"
+    "Под ним есть кнопки: отложить на 10 минут, на час, до завтра — или отметить ✅ Готово.\n\n"
     "<b>Кнопки внизу экрана</b>\n"
-    f"{BTN_NEW} — спрошу, что напомнить, а потом когда: можно выбрать кнопкой "
-    "(+10 мин, +1 час, завтра утром…) или написать время\n"
-    f"{BTN_LIST} — список с кнопками удаления 🗑\n"
+    f"{BTN_NEW} — по шагам: сначала текст, потом время\n"
+    f"{BTN_LIST} — список, удаление кнопкой 🗑\n"
     f"{BTN_HELP} — эта справка\n\n"
     "<b>Команды</b>\n"
-    "/new — новое напоминание по шагам (как кнопка)\n"
-    "/remind — создать одной строкой:\n"
-    "<code>/remind 18:30 Позвонить маме</code>\n"
+    "/new — новое напоминание по шагам\n"
     "/list — все активные напоминания\n"
-    "/delete — удалить по номеру:\n"
-    "<code>/delete 3</code>\n"
+    "/delete — удалить по номеру: <code>/delete 3</code>\n"
     "/cancel — отменить создание напоминания\n"
-    "/help — эта справка\n\n"
+    "/remind — то же, что написать без команды:\n"
+    "<code>/remind через 2 часа Позвонить маме</code>\n\n"
     "<b>Полезно знать</b>\n"
     f"🌍 Время считаю по поясу <b>{TIMEZONE_NAME}</b>\n"
     "📅 Если указанное время сегодня уже прошло, напомню завтра\n"
-    "🔢 Номера напоминаний не меняются, когда удаляете другие\n"
-    "💾 Напоминания сохраняются, даже если бота перезапустить\n\n"
+    "🔢 Номера напоминаний не меняются, когда удаляете другие\n\n"
     "<i>Нажмите на пример в сером прямоугольнике — он скопируется.</i>"
+)
+
+TIME_HELP = (
+    "⚠️ Не понял время. Нажмите кнопку выше или напишите, например:\n" + TIME_EXAMPLES
 )
 
 
@@ -434,11 +517,12 @@ HELP_TEXT = (
 # ВАЖНО: telebot проверяет обработчики сверху вниз и вызывает первый подходящий.
 # Поэтому обработчик «любого текста» (раздел 6) стоит после всех остальных.
 
-# Состояние диалога. Создание напоминания кнопками идёт в несколько шагов:
-# сначала бот спрашивает текст, потом время. Между сообщениями нужно помнить,
-# на каком шаге каждый чат. Для этого словарь:
-#   states[chat_id] = {"step": "text", "msg_id": 55}                   — ждём текст
-#   states[chat_id] = {"step": "time", "text": "...", "msg_id": 56}    — ждём время
+# Состояние диалога. Создание напоминания по шагам идёт в несколько сообщений,
+# и между ними нужно помнить, на каком шаге каждый чат. Для этого словарь:
+#   states[chat_id] = {"step": "text", "msg_id": 55}                    — ждём текст
+#   states[chat_id] = {"step": "text", "msg_id": 55, "due": "...", "repeat": None}
+#                                                  — ждём текст, время уже известно
+#   states[chat_id] = {"step": "time", "text": "...", "msg_id": 56}     — ждём время
 # msg_id — номер сообщения с кнопками, чтобы отличать свежие кнопки от старых.
 # Храним в памяти: если перезапустить бота посреди диалога, начнёте заново — не страшно.
 states = {}
@@ -462,7 +546,38 @@ def reset_state(chat_id):
     """Прерывает начатое создание напоминания (если человек нажал другую команду или кнопку)."""
     st = states.pop(chat_id, None)
     if st:
-        remove_buttons(chat_id, st.get("msg_id"))
+        set_buttons(chat_id, st.get("msg_id"))
+
+
+def ask_text(chat_id, due=None, repeat=None):
+    """Шаг «Что напомнить?». Если время уже известно — запоминаем его вместе с шагом."""
+    question = "📝 <b>Что напомнить?</b>" if due is None else f"📝 <b>Что напомнить {human_when(due)}?</b>"
+    sent = bot.send_message(chat_id, f"{question}\n\nНапишите текст одним сообщением, например:\n<i>Позвонить маме</i>",
+                            reply_markup=cancel_keyboard())
+    states[chat_id] = {"step": "text", "msg_id": sent.message_id}
+    if due is not None:
+        states[chat_id].update(due=due.isoformat(), repeat=repeat)
+
+
+def ask_time(chat_id, text):
+    """Шаг «Когда напомнить?» с кнопками быстрого выбора."""
+    sent = bot.send_message(
+        chat_id,
+        f"🕐 <b>Когда напомнить?</b>\n\n📝 {escape(text)}\n\n"
+        f"Нажмите кнопку или напишите своё время, например:\n{TIME_EXAMPLES}",
+        reply_markup=time_keyboard(),
+    )
+    states[chat_id] = {"step": "time", "text": text, "msg_id": sent.message_id}
+
+
+def send_created(chat_id, text, due, repeat=None, reply_to=None):
+    """Создаёт напоминание и отправляет подтверждение с кнопками «Повторять» и «Удалить»."""
+    reminder = create_reminder(chat_id, text, due, repeat)
+    if reply_to is not None:
+        bot.reply_to(reply_to, created_text(reminder), reply_markup=created_keyboard(reminder))
+    else:
+        bot.send_message(chat_id, created_text(reminder), reply_markup=created_keyboard(reminder))
+    return reminder
 
 
 @bot.message_handler(commands=["start"])
@@ -476,7 +591,7 @@ def cmd_start(message):
 @bot.message_handler(commands=["help"])
 @bot.message_handler(func=lambda m: m.text == BTN_HELP)
 def cmd_help(message):
-    """/help и кнопка «Помощь» — подробное описание всех команд."""
+    """/help и кнопка «Помощь» — подробное описание всех возможностей."""
     reset_state(message.chat.id)
     bot.send_message(message.chat.id, HELP_TEXT, reply_markup=main_keyboard())
 
@@ -486,14 +601,7 @@ def cmd_help(message):
 def cmd_new(message):
     """/new и кнопка «Новое напоминание» — шаг 1: спрашиваем текст."""
     reset_state(message.chat.id)
-    sent = bot.send_message(
-        message.chat.id,
-        "📝 <b>Что напомнить?</b>\n\n"
-        "Напишите текст одним сообщением, например:\n<i>Позвонить маме</i>",
-        reply_markup=cancel_keyboard(),
-    )
-    # Запоминаем: этот чат теперь на шаге «ждём текст»
-    states[message.chat.id] = {"step": "text", "msg_id": sent.message_id}
+    ask_text(message.chat.id)
 
 
 @bot.message_handler(commands=["cancel"])
@@ -508,32 +616,32 @@ def cmd_cancel(message):
 
 @bot.message_handler(commands=["remind"])
 def cmd_remind(message):
-    """/remind 18:30 Позвонить маме — создаёт напоминание одной строкой."""
+    """/remind через 2 часа Позвонить маме — создаёт напоминание одной строкой."""
     reset_state(message.chat.id)
-    # split(maxsplit=2) режет текст по пробелам не больше двух раз:
-    # "/remind 18:30 Позвонить маме" -> ["/remind", "18:30", "Позвонить маме"]
-    # Благодаря maxsplit текст напоминания остаётся целым, со всеми пробелами.
-    parts = message.text.split(maxsplit=2)
-    if len(parts) < 3:
-        bot.reply_to(message, "⚠️ Напишите время и текст, например:\n<code>/remind 18:30 Позвонить маме</code>\n\n"
-                              f"Или нажмите <b>{BTN_NEW}</b> — я спрошу всё по шагам.")
+    # split(maxsplit=1) отрезает команду от всего остального:
+    # "/remind через 2 часа Позвонить маме" -> ["/remind", "через 2 часа Позвонить маме"]
+    parts = message.text.split(maxsplit=1)
+    usage = ("Напишите, когда и что напомнить, например:\n"
+             "<code>/remind через 2 часа Позвонить маме</code>\n"
+             "<code>/remind 18:30 Забрать заказ</code>")
+    if len(parts) < 2:
+        bot.reply_to(message, f"⚠️ {usage}")
         return  # return — выходим из функции, дальше не идём
 
-    time_part, text = parts[1], parts[2].strip()
-
-    parsed = parse_time(time_part)
-    if parsed is None:
-        bot.reply_to(message, f"⚠️ Не понял время «{escape(time_part)}».\n"
-                              "Напишите часы и минуты через двоеточие: <code>18:30</code> или <code>9:05</code>")
+    try:
+        when = understand(parts[1])
+    except WhenError as error:
+        bot.reply_to(message, f"⚠️ {escape(str(error))}")
         return
-
-    error = text_error(text)
+    if when is None:
+        bot.reply_to(message, f"⚠️ Не понял, когда напомнить. {usage}")
+        return
+    error = text_error(when.text)
     if error:
-        bot.reply_to(message, f"⚠️ {error}")
+        bot.reply_to(message, f"⚠️ {error}\n\n{usage}")
         return
 
-    reminder = create_reminder(message.chat.id, text, next_occurrence(*parsed))  # * раскладывает (18, 30) на два аргумента
-    bot.reply_to(message, created_text(reminder))
+    send_created(message.chat.id, when.text, when.due, when.repeat, reply_to=message)
 
 
 @bot.message_handler(commands=["list"])
@@ -566,7 +674,7 @@ def cmd_delete(message):
 
 
 # ===========================================================================
-# 6. ДИАЛОГ СОЗДАНИЯ И INLINE-КНОПКИ
+# 6. ОБЫЧНЫЙ ТЕКСТ И INLINE-КНОПКИ
 # ===========================================================================
 
 # content_types=["text"] без других условий — ловит любой текст. Этот обработчик
@@ -574,53 +682,110 @@ def cmd_delete(message):
 # что не подошло командам и кнопкам меню выше.
 @bot.message_handler(content_types=["text"])
 def on_text(message):
-    """Ответы в диалоге создания (текст, потом время) и всё непонятное."""
+    """Любой текст: ответ в диалоге создания или напоминание одним сообщением."""
     chat_id = message.chat.id
     text = message.text.strip()
     st = states.get(chat_id)
 
-    if st is None:
-        # Диалога нет — значит, бот не ждал этого сообщения
-        bot.send_message(chat_id, "🤔 Не понял. Нажмите кнопку внизу экрана или отправьте /help",
-                         reply_markup=main_keyboard())
-        return
-
     if text.startswith("/"):
-        bot.reply_to(message, "⚠️ Такой команды нет. Ответьте на вопрос выше или нажмите /cancel")
+        hint = "Ответьте на вопрос выше или нажмите /cancel" if st else "Список команд — /help"
+        bot.reply_to(message, f"⚠️ Такой команды нет. {hint}")
         return
 
-    if st["step"] == "text":
-        # Шаг 1 -> 2: получили текст, теперь спрашиваем время
+    if st and st["step"] == "time":
+        answer_time(message, text)
+    elif st and st["step"] == "text":
+        answer_text(message, st, text)
+    else:
+        free_text(message, text)
+
+
+def free_text(message, text):
+    """Сообщение вне диалога: пробуем понять его как «когда + что»."""
+    chat_id = message.chat.id
+    try:
+        when = understand(text)
+    except WhenError as error:
+        bot.reply_to(message, f"⚠️ {escape(str(error))}")
+        return
+
+    if when is None:
+        # Времени в сообщении нет — считаем его текстом напоминания и спрашиваем, когда напомнить
         error = text_error(text)
         if error:
             bot.reply_to(message, f"⚠️ {error}")
             return
-        remove_buttons(chat_id, st.get("msg_id"))  # у вопроса «Что напомнить?» кнопка «Отмена» больше не нужна
-        sent = bot.send_message(
-            chat_id,
-            f"🕐 <b>Когда напомнить?</b>\n\n📝 {escape(text)}\n\n"
-            "Выберите кнопку или напишите время, например <code>18:30</code>",
-            reply_markup=time_keyboard(),
-        )
-        states[chat_id] = {"step": "time", "text": text, "msg_id": sent.message_id}
-
-    elif st["step"] == "time":
-        # Шаг 2: время написали текстом
-        parsed = parse_time(text)
-        if parsed is None:
-            bot.reply_to(message, f"⚠️ Не понял время «{escape(text)}».\n"
-                                  "Напишите, например, <code>18:30</code> или выберите кнопку выше.")
+        ask_time(chat_id, text)
+    elif not when.text:
+        # Есть только время («через 5 минут») — спрашиваем, что напомнить
+        ask_text(chat_id, when.due, when.repeat)
+    else:
+        error = text_error(when.text)
+        if error:
+            bot.reply_to(message, f"⚠️ {error}")
             return
-        st = take_state(chat_id, "time")
+        send_created(chat_id, when.text, when.due, when.repeat, reply_to=message)
+
+
+def answer_text(message, st, text):
+    """Шаг диалога «Что напомнить?»: получили текст."""
+    chat_id = message.chat.id
+
+    if "due" in st:
+        # Время уже известно — сразу создаём
+        error = text_error(text)
+        if error:
+            bot.reply_to(message, f"⚠️ {error}")
+            return
+        st = take_state(chat_id, "text")
         if st is None:
-            return  # напоминание уже успели создать кнопкой
-        remove_buttons(chat_id, st["msg_id"])
-        reminder = create_reminder(chat_id, st["text"], next_occurrence(*parsed))
-        bot.send_message(chat_id, created_text(reminder))
+            return
+        set_buttons(chat_id, st.get("msg_id"))
+        send_created(chat_id, text, datetime.fromisoformat(st["due"]), st.get("repeat"))
+        return
+
+    # Человек мог написать всё сразу: «позвонить маме через 5 минут»
+    try:
+        when = understand(text)
+    except WhenError as error:
+        bot.reply_to(message, f"⚠️ {escape(str(error))}")
+        return
+    reminder_text = when.text if when and when.text else text
+    error = text_error(reminder_text)
+    if error:
+        bot.reply_to(message, f"⚠️ {error}")
+        return
+
+    set_buttons(chat_id, st.get("msg_id"))  # у вопроса «Что напомнить?» кнопка «Отмена» больше не нужна
+    if when and when.text:
+        states.pop(chat_id, None)
+        send_created(chat_id, when.text, when.due, when.repeat)
+    else:
+        ask_time(chat_id, text)
+
+
+def answer_time(message, text):
+    """Шаг диалога «Когда напомнить?»: время написали текстом."""
+    chat_id = message.chat.id
+    try:
+        # allow_bare=True: бот сам спросил про время, поэтому «15 минут» без «через» тоже понятно
+        when = understand(text, allow_bare=True)
+    except WhenError as error:
+        bot.reply_to(message, f"⚠️ {escape(str(error))}")
+        return
+    if when is None or when.text:
+        bot.reply_to(message, TIME_HELP)
+        return
+
+    st = take_state(chat_id, "time")
+    if st is None:
+        return  # напоминание уже успели создать кнопкой
+    set_buttons(chat_id, st["msg_id"])
+    send_created(chat_id, st["text"], when.due, when.repeat)
 
 
 # Обработчики нажатий inline-кнопок. В них приходит call:
-#   call.data    — строка, которую мы записали в callback_data кнопки ("del:3", "time:+10", "cancel")
+#   call.data    — строка, которую мы записали в callback_data кнопки ("del:3", "time:2", "cancel")
 #   call.message — сообщение, под которым была кнопка
 # На каждое нажатие нужно ответить answer_callback_query — иначе у пользователя
 # на кнопке будут бесконечно крутиться «часики». Текст ответа всплывает сверху на пару секунд.
@@ -633,13 +798,14 @@ def cb_time(call):
     if st is None:
         # Кнопка от старого вопроса (или напоминание уже создано) — не создаём дубль
         bot.answer_callback_query(call.id, "Эта кнопка уже неактуальна")
-        remove_buttons(chat_id, call.message.message_id)
+        set_buttons(chat_id, call.message.message_id)
         return
 
-    due = due_from_quick(call.data.split(":", 1)[1])  # "time:+10" -> "+10"
-    reminder = create_reminder(chat_id, st["text"], due)
+    phrase = QUICK_TIMES[int(call.data.split(":", 1)[1])][1]  # "time:4" -> "через 2 часа"
+    when = understand(phrase)
+    reminder = create_reminder(chat_id, st["text"], when.due)
     bot.answer_callback_query(call.id, "✅ Напоминание создано")
-    edit_message(call.message, created_text(reminder))  # превращаем вопрос в подтверждение
+    edit_message(call.message, created_text(reminder), created_keyboard(reminder))  # вопрос превращаем в подтверждение
 
 
 @bot.callback_query_handler(func=lambda call: call.data == "cancel")
@@ -665,48 +831,154 @@ def cb_delete(call):
     edit_message(call.message, text, keyboard)
 
 
+@bot.callback_query_handler(func=lambda call: call.data.startswith("rm:"))
+def cb_remove(call):
+    """Нажата кнопка «Удалить» под сообщением о созданном напоминании."""
+    chat_id = call.message.chat.id
+    found = delete_reminder(chat_id, int(call.data.split(":", 1)[1]))
+    if found:
+        bot.answer_callback_query(call.id, "🗑 Удалено")
+        edit_message(call.message, f"🗑 <i>Напоминание удалено</i>\n\n📝 {escape(found['text'])}")
+    else:
+        bot.answer_callback_query(call.id, "Этого напоминания уже нет")
+        set_buttons(chat_id, call.message.message_id)
+
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("rep:"))
+def cb_repeat_menu(call):
+    """Нажата кнопка «Повторять»: показываем варианты."""
+    chat_id = call.message.chat.id
+    reminder = find_reminder(chat_id, int(call.data.split(":", 1)[1]))
+    if reminder is None or not is_active(reminder):
+        bot.answer_callback_query(call.id, "Это напоминание уже сработало или удалено")
+        set_buttons(chat_id, call.message.message_id)
+        return
+    bot.answer_callback_query(call.id)
+    set_buttons(chat_id, call.message.message_id, repeat_keyboard(reminder))
+
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("setrep:"))
+def cb_set_repeat(call):
+    """Выбран вариант повтора."""
+    chat_id = call.message.chat.id
+    _prefix, rid, mode = call.data.split(":")  # "setrep:3:daily" -> ["setrep", "3", "daily"]
+    if mode == "keep":
+        reminder = find_reminder(chat_id, int(rid))
+        if reminder is not None and not is_active(reminder):
+            reminder = None
+    else:
+        reminder = set_repeat(chat_id, int(rid), None if mode == "none" else mode)
+    if reminder is None:
+        bot.answer_callback_query(call.id, "Это напоминание уже сработало или удалено")
+        set_buttons(chat_id, call.message.message_id)
+        return
+    answers = {"keep": None, "none": "Повтор выключен"}
+    bot.answer_callback_query(call.id, answers.get(mode, f"🔁 Буду напоминать {REPEAT_LABELS.get(mode, '')}"))
+    edit_message(call.message, created_text(reminder), created_keyboard(reminder))
+
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("snz:"))
+def cb_snooze(call):
+    """Нажата кнопка «Отложить» под сработавшим напоминанием."""
+    chat_id = call.message.chat.id
+    _prefix, rid, code = call.data.split(":")  # "snz:3:10" -> отложить №3 на 10 минут
+    reminder = find_reminder(chat_id, int(rid))
+    if reminder is None:
+        bot.answer_callback_query(call.id, "Этого напоминания уже нет — создайте новое")
+        set_buttons(chat_id, call.message.message_id)
+        return
+
+    due = understand("завтра в 9:00").due if code == "tom" else in_minutes(now_local(), int(code))
+    # Отложенное — это новое разовое напоминание с тем же текстом.
+    # У повторяющегося основное расписание при этом не трогаем.
+    new = create_reminder(chat_id, reminder["text"], due)
+    if not is_active(reminder):
+        delete_reminder(chat_id, reminder["id"], only_active=False)  # сработавшую запись больше хранить незачем
+
+    bot.answer_callback_query(call.id, "⏰ Отложено")
+    edit_message(call.message,
+                 f"⏰ <b>Отложено</b> — напомню {human_when(due)}\n\n"
+                 f"📝 {escape(new['text'])}\n🔢 Номер: <b>{new['id']}</b>")
+
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("done:"))
+def cb_done(call):
+    """Нажата кнопка «Готово» под сработавшим напоминанием."""
+    chat_id = call.message.chat.id
+    reminder = find_reminder(chat_id, int(call.data.split(":", 1)[1]))
+    bot.answer_callback_query(call.id, "✅ Отлично!")
+    if reminder is None:
+        set_buttons(chat_id, call.message.message_id)
+        return
+    text = f"✅ <b>Выполнено</b>\n\n📝 <s>{escape(reminder['text'])}</s>"  # <s> — зачёркнутый текст
+    if is_active(reminder) and reminder.get("repeat"):
+        text += f"\n\n🔁 Следующее — {human_when(get_due(reminder))}"
+    else:
+        delete_reminder(chat_id, reminder["id"], only_active=False)
+    edit_message(call.message, text)
+
+
 # ===========================================================================
 # 7. ПРОВЕРКА НАПОМИНАНИЙ ПО ВРЕМЕНИ (работает в отдельном потоке)
 # ===========================================================================
 
 def check_reminders():
     """Один проход: отправляет все напоминания, время которых уже наступило."""
-    now = datetime.now(TZ)
+    now = now_local()
 
     with data_lock:
-        due_now = [r for r in data["reminders"] if get_due(r) <= now]
+        due_now = [r for r in data["reminders"] if is_active(r) and get_due(r) <= now]
 
     # Отправляем уже без замка: отправка по сети может занять пару секунд,
     # и не нужно всё это время мешать обработчикам команд.
     for r in due_now:
         due = get_due(r)
         text = f"⏰ <b>Напоминание!</b>\n\n📝 {escape(r['text'])}"
+        if r.get("repeat"):
+            text += f"\n🔁 {capitalize(REPEAT_LABELS[r['repeat']])}"
         # Если бот был выключен и напоминание опоздало, честно скажем об этом
         if now - due > timedelta(minutes=2):
             text += f"\n\n<i>⌛ Должно было прийти {due.strftime('%d.%m в %H:%M')}, но бот был выключен</i>"
 
         try:
-            bot.send_message(r["chat_id"], text)
+            bot.send_message(r["chat_id"], text, reply_markup=fired_keyboard(r))
             log.info("Отправил напоминание №%s в чат %s", r["id"], r["chat_id"])
         except ApiTelegramException as error:
             # Ошибку прислал сам Telegram. 403 — пользователь заблокировал бота,
             # 400 — чат не найден. Повторять бесполезно, поэтому напоминание удалим.
             if error.error_code in (400, 403):
                 log.warning("Не могу отправить напоминание №%s (%s), удаляю его", r["id"], error.description)
+                with data_lock:
+                    if r in data["reminders"]:
+                        data["reminders"].remove(r)
+                        save_data()
             else:
                 log.warning("Telegram вернул ошибку для №%s, попробую через минуту: %s", r["id"], error)
-                continue  # continue — пропускаем удаление, напоминание останется до следующей проверки
+            continue  # continue — переходим к следующему напоминанию
         except Exception as error:
-            # Например, пропал интернет. Не удаляем — попробуем снова через минуту.
+            # Например, пропал интернет. Ничего не меняем — попробуем снова через минуту.
             log.warning("Не удалось отправить №%s, попробую через минуту: %s", r["id"], error)
             continue
 
         with data_lock:
-            # Проверяем, что напоминание ещё в списке: его могли удалить командой /delete,
-            # пока мы его отправляли
+            # Проверяем, что напоминание ещё в списке: его могли удалить, пока мы его отправляли
             if r in data["reminders"]:
-                data["reminders"].remove(r)
+                if r.get("repeat"):
+                    # Повторяющееся переносим на следующий раз
+                    r["due"] = next_repeat(due, r["repeat"], now).isoformat()
+                else:
+                    # Разовое помечаем сработавшим (а не удаляем) — чтобы работала кнопка «Отложить»
+                    r["fired_at"] = now.isoformat(timespec="seconds")
                 save_data()
+
+    # Уборка: сработавшие напоминания старше KEEP_FIRED_DAYS дней больше не нужны
+    with data_lock:
+        border = now - timedelta(days=KEEP_FIRED_DAYS)
+        old = [r for r in data["reminders"] if not is_active(r) and datetime.fromisoformat(r["fired_at"]) < border]
+        if old:
+            for r in old:
+                data["reminders"].remove(r)
+            save_data()
 
 
 def reminder_loop():
@@ -731,6 +1003,27 @@ def reminder_loop():
 # Блок `if __name__ == "__main__":` выполняется, только когда файл запускают
 # напрямую (python bot.py), а не импортируют из другого файла.
 
+def setup_profile():
+    """Настраивает то, что видно в Telegram до начала общения: меню команд и описание бота."""
+    bot.set_my_commands([
+        types.BotCommand("start", "Главное меню"),
+        types.BotCommand("new", "Новое напоминание по шагам"),
+        types.BotCommand("list", "Мои напоминания"),
+        types.BotCommand("remind", "Быстро: /remind через 2 часа текст"),
+        types.BotCommand("delete", "Удалить: /delete номер"),
+        types.BotCommand("cancel", "Отменить создание"),
+        types.BotCommand("help", "Все возможности"),
+    ])
+    # Описание — текст на пустом экране чата, до нажатия «Старт»
+    bot.set_my_description(
+        "Напоминаю о важном в нужное время ⏰\n\n"
+        "Просто напишите: «через 10 минут выключить плиту» или «завтра в 9 позвонить врачу».\n\n"
+        "Умею повторять напоминания каждый день, по будням или раз в неделю и откладывать их одной кнопкой."
+    )
+    # Короткое описание — в профиле бота и в ссылке на него
+    bot.set_my_short_description("Напоминалка: напишите «через 10 минут…» или «завтра в 9…» — напомню вовремя ⏰")
+
+
 if __name__ == "__main__":
     # Проверяем токен: get_me() спрашивает у Telegram «кто я?».
     # Если токен неверный, Telegram ответит ошибкой 401.
@@ -741,27 +1034,17 @@ if __name__ == "__main__":
             sys.exit("Telegram не принял токен (ошибка 401). Проверьте BOT_TOKEN в файле .env.")
         raise
 
-    # Список команд для синей кнопки «Меню» слева от поля ввода в Telegram.
-    # Заменяет то, что было настроено через @BotFather /setcommands.
     try:
-        bot.set_my_commands([
-            types.BotCommand("start", "Главное меню"),
-            types.BotCommand("new", "Новое напоминание по шагам"),
-            types.BotCommand("list", "Мои напоминания"),
-            types.BotCommand("remind", "Быстро: /remind 18:30 текст"),
-            types.BotCommand("delete", "Удалить: /delete номер"),
-            types.BotCommand("cancel", "Отменить создание"),
-            types.BotCommand("help", "Описание всех команд"),
-        ])
-    except ApiTelegramException as error:
-        log.warning("Не удалось обновить меню команд: %s", error)  # бот работает и без него
+        setup_profile()
+    except Exception as error:
+        log.warning("Не удалось обновить меню и описание бота: %s", error)  # бот работает и без этого
 
     # Запускаем проверку напоминаний во втором потоке.
     # daemon=True — поток сам завершится, когда вы остановите бота (Ctrl+C).
     threading.Thread(target=reminder_loop, daemon=True).start()
 
-    log.info("Бот @%s запущен. Напоминаний в файле: %s. Остановить — Ctrl+C",
-             me.username, len(data["reminders"]))
+    log.info("Бот @%s запущен. Активных напоминаний: %s. Остановить — Ctrl+C",
+             me.username, sum(1 for r in data["reminders"] if is_active(r)))
 
     # infinity_polling — бесконечный опрос Telegram. Если пропадёт интернет,
     # telebot сам переподключится, бот не упадёт.
