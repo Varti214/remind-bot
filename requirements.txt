@@ -1,0 +1,10 @@
+# Библиотеки, которые нужны боту. Установка: pip install -r requirements.txt
+
+# Работа с Telegram (в коде подключается как `import telebot`)
+pyTelegramBotAPI>=4.14
+
+# Чтение настроек (токена) из файла .env
+python-dotenv>=1.0
+
+# База часовых поясов. На Windows её нет в системе, без неё не заработает Europe/Moscow
+tzdata>=2024.1
